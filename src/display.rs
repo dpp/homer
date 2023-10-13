@@ -22,7 +22,7 @@ pub enum DrawPos {
 impl DrawPos {
     pub fn upper_left(&self) -> Point {
         match self {
-            DrawPos::Button(b) => Point::new(20 + 94 * (*b as i32), 220),
+            DrawPos::Button(b) => Point::new(20 + 98 * (*b as i32), 220),
             DrawPos::Pos(p) => p.clone(),
             DrawPos::Box(r) => r.top_left.clone(),
         }
