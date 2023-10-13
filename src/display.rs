@@ -29,14 +29,19 @@ impl DrawPos {
     }
 
     pub fn compute_bounding_box(&self, d: Option<&Rectangle>) -> Rectangle {
-
-      let d: Rectangle = match d {
-        Some(r) => r.clone(),
-        None => match self {
-          DrawPos::Box(b) => b.clone(),
-          _ => Rectangle { top_left: Point{x: 0, y:0}, size: Size{ width: 0, height: 0} }
-        }
-      };
+        let d: Rectangle = match d {
+            Some(r) => r.clone(),
+            None => match self {
+                DrawPos::Box(b) => b.clone(),
+                _ => Rectangle {
+                    top_left: Point { x: 0, y: 0 },
+                    size: Size {
+                        width: 0,
+                        height: 0,
+                    },
+                },
+            },
+        };
 
         match self {
             DrawPos::Button(b) => Rectangle {
@@ -126,7 +131,9 @@ pub fn draw_loop(
             DrawCmd::Clear { color, pos } => {
                 let bb = pos.compute_bounding_box(None);
 
-                display.fill_solid(&bb, color).map_err(|e| anyhow::anyhow!("Display error: {:?}", e))?;
+                display
+                    .fill_solid(&bb, color)
+                    .map_err(|e| anyhow::anyhow!("Display error: {:?}", e))?;
             }
             DrawCmd::Text {
                 pos,

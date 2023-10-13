@@ -295,7 +295,7 @@ fn render_states(
         match c {
             HAConnect::Text { line, text, color } => {
                 let cu16: RawU16 = (*color).into();
-                
+
                 // don't redisplay
                 if Some(text) != last_state.get(text) {
                     last_state.insert(text.clone(), text.clone());
