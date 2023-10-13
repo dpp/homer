@@ -2,3 +2,7 @@
 /.embuild
 /target
 /Cargo.lock
+/configs/[0-9]*.json
+/configs/[a-f0-9][a-f0-9]_[a-f0-9][a-f0-9]_[a-f0-9][a-f0-9].json
+
+

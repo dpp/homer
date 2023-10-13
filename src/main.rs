@@ -1,33 +1,79 @@
 use anyhow::Result;
-use display_interface_spi::SPIInterfaceNoCS;
-use embedded_graphics::mono_font::{ascii::FONT_10X20, MonoTextStyle};
-use embedded_graphics::pixelcolor::Rgb565;
-use embedded_graphics::prelude::*;
-use embedded_graphics::primitives::Rectangle;
-use embedded_graphics::text::*;
-
-use chrono::{Datelike, Timelike, Utc};
-use esp_idf_hal::delay;
-use esp_idf_hal::gpio::{self};
-use esp_idf_hal::peripheral;
+use chrono::{Local, Timelike};
+use crossbeam::select;
+use embedded_graphics::{
+    pixelcolor::{raw::RawU16, Rgb565},
+    prelude::{Point, RgbColor},
+};
 use esp_idf_hal::prelude::*;
-use esp_idf_hal::spi::{self};
-use esp_idf_svc::nvs::{EspNvs, EspNvsPartition, NvsDefault};
-use esp_idf_svc::sntp::{SyncMode, SyncStatus};
-use esp_idf_svc::{sntp, wifi::*};
-use esp_idf_sys as _; // If using the `binstart` feature of `esp-idf-sys`, always keep this module imported
+use esp_idf_svc::{eventloop::EspSystemEventLoop, nvs::EspDefaultNvsPartition};
+use esp_idf_sys::{self as _, esp_read_mac, ESP_OK};
+use json::JsonValue;
+use std::{
+    collections::HashMap,
+    ops::Deref,
+    sync::{atomic::AtomicI32, mpsc::Sender},
+};
+// If using the `binstart` feature of `esp-idf-sys`, always keep this module imported
 use log::*;
-use mipidsi;
 
-use std::sync::mpsc;
-use std::sync::mpsc::Receiver;
+use profont::PROFONT_24_POINT;
+
+use crossbeam::channel::bounded;
+use homer::{
+    buttons::*,
+    display::*,
+    files::{mount_spiffs, read_file},
+    util::*,
+    wifi::*,
+};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc::{self},
+    Arc,
+};
 use std::time::Duration;
 
-use embedded_svc::wifi::{ClientConfiguration, Configuration};
-use esp_idf_svc::{eventloop::EspSystemEventLoop, nvs::EspDefaultNvsPartition, wifi::EspWifi};
+static HAS_WIFI: AtomicBool = AtomicBool::new(false);
+static HAS_TIME: AtomicBool = AtomicBool::new(false);
+static LAST_QUAD: AtomicI32 = AtomicI32::new(-1);
 
-use esp_idf_hal::adc::config::Config;
-use esp_idf_hal::adc::*;
+fn fetch_config() -> Vec<HAConnect> {
+    let mut mac_buffer: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
+    let ok = unsafe {
+        esp_read_mac(
+            mac_buffer.as_mut_ptr(),
+            esp_idf_sys::esp_mac_type_t_ESP_MAC_WIFI_STA,
+        )
+    };
+    let filename: String = if ok == ESP_OK {
+        format!(
+            "{:02x}_{:02x}_{:02x}",
+            mac_buffer[3], mac_buffer[4], mac_buffer[5],
+        )
+    } else {
+        "base".into()
+    };
+
+    let conf_string = match read_file(&format!("{}.json", filename))
+        .or_else(|_| read_file("base.json"))
+        .ok()
+    {
+        Some(v) => v,
+        None => "this_is_bad".into(),
+    };
+    match serde_json::from_str(&conf_string) {
+        Ok(v) => v,
+        Err(e) => {
+            info!("Failed to parse JSON for {} error {:?}", filename, e);
+            vec![HAConnect::Text {
+                line: 0,
+                text: "Failed to load config!".into(),
+                color: 0,
+            }]
+        }
+    }
+}
 
 fn main() -> Result<()> {
     // It is necessary to call this function once. Otherwise some patches to the runtime
@@ -37,20 +83,46 @@ fn main() -> Result<()> {
     // Bind the log crate to the ESP Logging facilities
     esp_idf_svc::log::EspLogger::initialize_default();
 
-    info!("Hello, world!");
+    // set timezone see https://www.gnu.org/software/libc/manual/html_node/TZ-Variable.html
+    std::env::set_var("TZ", env!("HOMER_TZ"));
+    unsafe {
+        esp_idf_sys::tzset();
+    };
 
     let peripherals = Peripherals::take().unwrap();
     let sysloop = EspSystemEventLoop::take()?;
     let pins = peripherals.pins;
-    //  let mut nvs = EspDefaultNvsPartition::take()?;
+    let mut _nvs = EspDefaultNvsPartition::take()?;
 
-    let (tx, rx) = mpsc::channel::<DrawCmd>();
+    mount_spiffs()?;
+
+    info!("Spiffs mounted!");
+
+    let (display_tx, display_rx) = mpsc::channel::<DrawCmd>();
+
+    let (button_tx, button_rx) = bounded::<usize>(5);
+
+    let (ha_tx, ha_rx) = bounded::<Arc<JsonValue>>(60);
+
+    let (socket_tx, socket_rx) = mpsc::channel::<SocketCmd>();
+
+    let main_socket_tx = socket_tx.clone();
+
+    // colors
+    // red  0xf800 63488
+    // green  0x7e0 2016
+    // blue  0x1f 31
+    // magenta  0xf81f 63519
+    // yellow  0xffe3 65507
+    // cyan  0x7ff 2047
+    // black 0x0 0
+    // white 0xffff 65535
 
     std::thread::Builder::new()
-        .stack_size(20000)
+        .stack_size(10000)
         .spawn(move || {
             draw_loop(
-                rx,
+                display_rx,
                 pins.gpio45,
                 pins.gpio4,
                 pins.gpio48,
@@ -62,329 +134,256 @@ fn main() -> Result<()> {
             .unwrap();
         })?;
 
-    tx.send(DrawCmd::Erase {
+    // clear the screen
+    display_tx.send(DrawCmd::Erase {
         color: Rgb565::WHITE,
     })?;
 
-    use esp_idf_hal::adc;
-
-    let mut adc = AdcDriver::new(peripherals.adc1, &Config::new().calibration(true))?;
-    let mut adc_pin = AdcChannelDriver::<_, adc::Atten11dB<adc::ADC1>>::new(pins.gpio1)?;
-
-    fn reading_to_button(reading: u16) -> Option<u8> {
-        if reading > 700 && reading < 1000 {
-            Some(3)
-        } else if reading > 1800 && reading < 2200 {
-            Some(2)
-        } else if reading > 2300 && reading < 2600 {
-            Some(1)
-        } else {
-            None
-        }
-    }
-
+    // start the thread that watches for button presses
     std::thread::Builder::new()
         .stack_size(3000)
         .spawn(move || {
-            // 700-900 button 3
-            // 1900-2200 button 2
-            // 2300-2500 button 1
-
-            let mut cur = reading_to_button(adc.read(&mut adc_pin).unwrap());
-            loop {
-                let now = reading_to_button(adc.read(&mut adc_pin).unwrap());
-                if now != cur {
-                    println!("Level {:?}", now);
-                    cur = now;
-                }
-
-                std::thread::sleep(Duration::from_millis(50));
-            }
+            button_loop(button_tx, pins.gpio1, peripherals.adc1).unwrap();
         })?;
 
-    let txc = tx.clone();
-
+    // start the thread that handles websockets
     std::thread::Builder::new()
-        .stack_size(20000)
+        .stack_size(4000)
         .spawn(move || {
-            let mut _wifi = wifi(peripherals.modem, sysloop.clone()).unwrap();
+            handle_websocket(&HAS_WIFI, socket_tx, socket_rx, ha_tx, HA_AUTH, HA_URL).unwrap();
+        })?;
 
-            test_https_client().unwrap();
-            info!("Done with http!");
+    let display_tx_2 = display_tx.clone();
 
-            let _sntp = sntp::EspSntp::new_default().unwrap();
+    // start the thread that deals with wifi
+    std::thread::Builder::new()
+        .stack_size(5000)
+        .spawn(move || {
+            // hold the reference so it doesn't get released
+            create_wifi(
+                SSID,
+                PASS,
+                &HAS_WIFI,
+                &LAST_QUAD,
+                display_tx_2,
+                peripherals.modem,
+                sysloop.clone(),
+                &HAS_TIME,
+            )
+            .unwrap();
+        })?;
 
-            info!("SNTP initialized");
+    // the main event loop
+    let mut last_time: String = "".into();
+    let mut first_sample = false;
+    let mut last_state: HashMap<String, String> = HashMap::new();
+    let mut states = HashMap::new();
+    let mut ha_config: Vec<HAConnect> = vec![];
 
-            let mut cnt = 0;
-            let mut not_sync = true;
-            loop {
-                cnt += 1;
-                txc.send(DrawCmd::Text {
-                    pos: DrawPos::Button1,
-                    text: format!("{} {}", cnt, if not_sync {" *"} else {""}),
-                    text_color: Rgb565::BLUE,
-                    background: Some(Rgb565::WHITE),
-                })
-                .unwrap();
-                std::thread::sleep(Duration::from_secs(7));
-                if not_sync {
-                    let status: SyncStatus = _sntp.get_sync_status();
-                    match status {
-                      SyncStatus::Completed => {
-                        not_sync = false;
-                      },
-                      SyncStatus::InProgress => {
-                        println!("Sync in progress");
-                      },
-                      SyncStatus::Reset => {
-                        println!("SNTP reset");
-                      }
+    loop {
+        // if we haven't sampled, but wifi is up, get the values for the stuff
+        // we're watching
+        if !first_sample && HAS_WIFI.load(Ordering::Relaxed) {
+            // the WIFI is up which means we've got the last quad which means we can load
+            // the correct config
+            ha_config = fetch_config();
+            for connect in &ha_config {
+                states.insert(connect.ha_id().clone(), "".to_string());
+            }
+            for c in &ha_config {
+                match get_ha_state(&c.ha_id(), HA_URL, &HA_HEADERS) {
+                    Ok(json) => {
+                        let val = &json["state"];
+                        states.insert(c.ha_id().clone(), val.to_string());
+                    }
+                    Err(e) => {
+                        info!("Failed to get state for {} error {:?}", c.ha_id(), e);
                     }
                 }
             }
-        })?;
+            first_sample = true;
 
-    let mut cnt = 190_235;
-    loop {
-        tx.send(DrawCmd::Text {
-            pos: DrawPos::Button2,
-            text: format!("{}", cnt),
-            text_color: Rgb565::GREEN,
-            background: Some(Rgb565::WHITE),
-        })?;
+            // render the layout
+            render_states(&ha_config, &states, &mut last_state, &display_tx);
+        }
 
-        tx.send(DrawCmd::Text {
-            pos: DrawPos::Pos(Point::new(10, 20)),
-            text: format!("{}", Utc::now()),
-            text_color: RgbColor::BLACK,
-            background: Some(RgbColor::WHITE),
-        })?;
-        cnt += 1;
-        std::thread::sleep(Duration::from_secs(1));
+        // if the SNTP server has been connected and we've got time, display it
+        if HAS_TIME.load(Ordering::Relaxed) {
+            let now = Local::now();
+            let this_time = format!("{:>9}:{:0>2}", now.hour(), now.minute());
+            if this_time != last_time {
+                display_tx.send(DrawCmd::Text {
+                    pos: DrawPos::Pos(Point::new(10, 20)),
+                    font: Some(PROFONT_24_POINT),
+                    text: this_time.clone(),
+                    text_color: RgbColor::BLACK,
+                    background: Some(RgbColor::WHITE),
+                })?;
+                last_time = this_time;
+            }
+        }
+
+        // receive from various channels and perform appropriate actions
+        select! {
+          // button press
+          recv(button_rx) -> msg => {
+            let the_button = msg?;
+            for c in &ha_config {
+              // find the button (there are < 10 items so the cost of looping is low even though it's O(n))
+              match c {
+                  // find the button
+                  HAConnect::Button{button, action_off, action_on, ..} if (*button as usize) == the_button=> {
+                    // is it on?
+                    let on = c.is_on(&states);
+                    // select the command
+                    let cmd = if on {action_off} else {action_on};
+                    // turn it into a JSON message for Home Assistant
+                    let json = cmd.as_json();
+                    // send it
+                    main_socket_tx.send(SocketCmd::SendJson(json))?;
+                  }
+                  _ => {}
+              }
+            }
+          },
+          // maybe a Home Assistant JSON web socket message
+          recv(ha_rx) -> msg => {
+            match msg {
+              Ok(json) => {
+                let json: &JsonValue = json.deref();
+                // get the entity_id
+                let entity = traverse(json, &["event","data","entity_id"]);
+                let mut changed = false;
+
+                // if we've got an 'entity_id' and it's one of the states we care about, update the state table
+                // and flag that there's been a change (why?... no need to redraw if there's no change)
+                if let Some(s) = &entity {
+                  if states.contains_key(s) {
+                    if let Some(v) = traverse(json, &["event","data","new_state","state"]) {
+                      states.insert(s.clone(), v);
+                      changed = true;
+                    }
+                  }
+                }
+
+                // if there's been a change, update the display
+                if changed {
+                  render_states(&ha_config, &states, &mut last_state, & display_tx);
+                }
+            },
+
+            Err(_) => {}
+          }
+        },
+
+        // timeout after a second so we can properly redraw the time even if
+        // nothing else has changed
+        default(Duration::from_secs(1)) => {}
+        };
     }
     // Ok(())
 }
 
-const SSID: &str = env!("SSID");
-const PASS: &str = env!("WIFI_PASSWORD");
-
-fn _get_nvs_count() -> Result<u32> {
-    let nvs_default_partition: EspNvsPartition<NvsDefault> = EspDefaultNvsPartition::take()?;
-
-    let test_namespace = "test_ns";
-    let nvs = EspNvs::new(nvs_default_partition, test_namespace, true)?;
-
-    let tag_u8 = "count";
-
-    let cur = match nvs.get_u32(tag_u8)? {
-        Some(v) => v,
-        None => 0,
-    } + 1;
-
-    nvs.set_u32(tag_u8, cur)?;
-
-    Ok(cur)
-}
-
-fn wifi(
-    modem: impl peripheral::Peripheral<P = esp_idf_hal::modem::Modem> + 'static,
-    sysloop: EspSystemEventLoop,
-) -> Result<Box<EspWifi<'static>>> {
-    let mut esp_wifi = EspWifi::new(modem, sysloop.clone(), None)?;
-
-    let mut wifi = BlockingWifi::wrap(&mut esp_wifi, sysloop)?;
-
-    wifi.start()?;
-
-    wifi.set_configuration(&Configuration::Client(ClientConfiguration {
-        ssid: SSID.into(),
-        password: PASS.into(),
-
-        ..Default::default()
-    }))?;
-
-    wifi.connect()?;
-
-    wifi.wait_netif_up()?;
-
-    let ip_info = wifi.wifi().sta_netif().get_ip_info()?;
-
-    info!("Wifi DHCP info: {:?}", ip_info);
-
-    //    ping(ip_info.subnet.gateway)?;
-
-    Ok(Box::new(esp_wifi))
-}
-
-fn test_https_client() -> anyhow::Result<()> {
-    use embedded_svc::http::client::*;
-    use embedded_svc::utils::io;
-    use esp_idf_svc::http::client::*;
-
-    let url = String::from("https://blog.goodstuff.im");
-
-    info!("About to fetch content from {}", url);
-
-    let mut client = Client::wrap(EspHttpConnection::new(&Configuration {
-        crt_bundle_attach: Some(esp_idf_sys::esp_crt_bundle_attach),
-
-        ..Default::default()
-    })?);
-
-    let mut response = client.get(&url)?.submit()?;
-
-    let mut body = [0_u8; 3048];
-
-    let read = io::try_read_full(&mut response, &mut body).map_err(|err| err.0)?;
-
-    info!(
-        "Body (truncated to 3K):\n{:?}",
-        String::from_utf8_lossy(&body[..read]).into_owned()
-    );
-
-    // Complete the response
-    while response.read(&mut body)? > 0 {}
-
-    Ok(())
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
-pub enum DrawPos {
-    Button1,
-    Button2,
-    Button3,
-    Pos(Point),
-    Box(Rectangle),
-}
-
-impl DrawPos {
-    pub fn upper_left(&self) -> Point {
-        match self {
-            DrawPos::Button1 => Point::new(20, 220),
-            DrawPos::Button2 => Point::new(114, 220),
-            DrawPos::Button3 => Point::new(207, 220),
-            DrawPos::Pos(p) => p.clone(),
-            DrawPos::Box(r) => r.top_left.clone(),
-        }
-    }
-
-    pub fn compute_bounding_box(&self, d: &Rectangle) -> Rectangle {
-        match self {
-            DrawPos::Button1 => Rectangle {
-                top_left: Point::new(20, 200),
-                size: Size::new(92, 40),
-            },
-            DrawPos::Button2 => Rectangle {
-                top_left: Point::new(114, 200),
-                size: Size::new(92, 40),
-            },
-            DrawPos::Button3 => Rectangle {
-                top_left: Point::new(207, 200),
-                size: Size::new(92, 40),
-            },
-            DrawPos::Pos(p) => Rectangle {
-                top_left: Point {
-                    x: p.x,
-                    y: p.y - d.size.height as i32 + 1,
-                },
-                size: Size::new(320, d.size.height + 1),
-            },
-            DrawPos::Box(r) => Rectangle {
-                top_left: Point {
-                    x: r.top_left.x,
-                    y: r.top_left.y - d.size.height as i32 + 1,
-                },
-                size: r.size.clone(),
-            },
-        }
-    }
-}
-
-pub enum DrawCmd {
-    Erase {
-        color: Rgb565,
-    },
-    Text {
-        pos: DrawPos,
-        text: String,
-        text_color: Rgb565,
-        background: Option<Rgb565>,
-    },
-}
-
-fn draw_loop(
-    rx: Receiver<DrawCmd>,
-    backlight: gpio::Gpio45,
-    dc: gpio::Gpio4,
-    rst: gpio::Gpio48,
-    spi: spi::SPI2,
-    sclk: gpio::Gpio7,
-    sdo: gpio::Gpio6,
-    cs: gpio::Gpio5,
-) -> Result<()> {
-    info!("About to initialize the TTGO ST7789 LED driver");
-
-    let mut backlight = gpio::PinDriver::output(backlight)?;
-    backlight.set_low()?;
-
-    let di = SPIInterfaceNoCS::new(
-        spi::SpiDeviceDriver::new_single(
-            spi,
-            sclk,
-            sdo,
-            Option::<gpio::Gpio21>::None,
-            Some(cs),
-            &spi::SpiDriverConfig::new().dma(spi::Dma::Disabled),
-            &spi::SpiConfig::new().baudrate(26.MHz().into()),
-        )?,
-        gpio::PinDriver::output(dc)?,
-    );
-
-    let mut display = mipidsi::Builder::st7789(di)
-        .with_display_size(240, 320)
-        .with_invert_colors(mipidsi::ColorInversion::Inverted)
-        .with_orientation(mipidsi::options::Orientation::LandscapeInverted(true))
-        .init(&mut delay::Ets, Some(gpio::PinDriver::output(rst)?))
-        .map_err(|e| anyhow::anyhow!("Display error: {:?}", e))?;
-
-    loop {
-        let v = rx.recv()?;
-
-        match v {
-            DrawCmd::Erase { color } => {
-                display
-                    .clear(color)
-                    .map_err(|e| anyhow::anyhow!("Display error: {:?}", e))?;
+// update the display, only rendering states that have changed
+fn render_states(
+    connect: &[HAConnect],
+    states: &HashMap<String, String>,
+    last_state: &mut HashMap<String, String>,
+    display_tx: &Sender<DrawCmd>,
+) {
+    for c in connect {
+        match c {
+            HAConnect::Text { line, text, color } => {
+                let cu16: RawU16 = (*color).into();
+                
+                // don't redisplay
+                if Some(text) != last_state.get(text) {
+                    last_state.insert(text.clone(), text.clone());
+                    display_tx
+                        .send(DrawCmd::Text {
+                            pos: DrawPos::Pos(Point::new(10, 30 * (*line as i32 + 2))),
+                            font: Some(PROFONT_24_POINT),
+                            text: text.clone(),
+                            text_color: cu16.into(),
+                            background: Some(RgbColor::WHITE),
+                        })
+                        .unwrap();
+                }
             }
-            DrawCmd::Text {
-                pos,
+            HAConnect::Line {
+                line,
+                ha_id,
                 text,
-                text_color,
-                background,
+                make_int,
+                color,
+                ..
             } => {
-                let upper_left = pos.upper_left();
+                if let Some(st) = states.get(ha_id) {
+                    let line_str = if *make_int {
+                        format!(
+                            "{}{}",
+                            text,
+                            st.parse::<f64>()
+                                .ok()
+                                .map_or("".to_string(), |f| f.round().to_string())
+                        )
+                    } else {
+                        format!("{}{}", text, st)
+                    };
 
-                let t = Text::new(
-                    &text,
-                    upper_left,
-                    MonoTextStyle::new(&FONT_10X20, text_color),
-                );
+                    if Some(&line_str) != last_state.get(ha_id) {
+                        last_state.insert(ha_id.clone(), line_str.clone());
 
-                let bb = pos.compute_bounding_box(&t.bounding_box());
-                match background {
-                    Some(bc) => {
-                        
-                        display
-                            .fill_solid(&bb, bc)
-                            .map_err(|e| anyhow::anyhow!("Display error: {:?}", e))?
+                        let cu16: RawU16 = (*color).into();
+
+                        display_tx
+                            .send(DrawCmd::Text {
+                                pos: DrawPos::Pos(Point::new(10, 30 * (*line as i32 + 2))),
+                                font: Some(PROFONT_24_POINT),
+                                text: line_str,
+                                text_color: cu16.into(),
+                                background: Some(RgbColor::WHITE),
+                            })
+                            .unwrap();
                     }
-                    None => (),
-                };
-
-                t.draw(&mut display)
-                    .map_err(|e| anyhow::anyhow!("Display error: {:?}", e))?;
+                }
             }
-        };
+            HAConnect::Button {
+                button,
+                ha_id,
+                cmp,
+                text_on,
+                text_off,
+                color,
+                ..
+            } => {
+                let cur = states.get(ha_id);
+                let on = cmp == cur;
+                let disp = if on { text_on } else { text_off };
+                let last = last_state.get(ha_id);
+                let cu16: RawU16 = (*color).into();
+                if Some(disp) != last {
+                    last_state.insert(ha_id.clone(), disp.clone());
+                    display_tx
+                        .send(DrawCmd::Text {
+                            pos: DrawPos::Button(*button),
+                            font: None,
+                            text: disp.clone(),
+                            text_color: cu16.into(),
+                            background: Some(RgbColor::WHITE),
+                        })
+                        .unwrap();
+                }
+            }
+        }
     }
 }
+
+const SSID: &str = env!("HOMER_SSID");
+const PASS: &str = env!("HOMER_WIFI_PASSWORD");
+const HA_AUTH: &str = env!("HOMER_HA_AUTH");
+const HA_URL: &str = env!("HOMER_HA_URL");
+const HA_HEADERS: [(&str, &str); 2] = [
+    ("Content-Type", "application/json"),
+    ("Authorization", concat!("Bearer ", env!("HOMER_HA_AUTH"))),
+];
