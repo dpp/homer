@@ -72,6 +72,7 @@ impl PartialEq<i64> for CmpValue {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Hash)]
 pub enum HAAction {
     Scene(String),
+    Service { ha_id: String, service: String },
 }
 
 static HAACTION_ID: AtomicI64 = AtomicI64::new(1024);
@@ -85,6 +86,18 @@ impl HAAction {
               "service": "turn_on",
               "target": {
                 "entity_id": s.clone()
+              },
+
+              "service_data": {},
+              "id": HAACTION_ID.fetch_add(1, Ordering::Relaxed)
+            },
+
+            HAAction::Service { ha_id, service } => object! {
+                "type": "call_service",
+              "domain": "light",
+              "service": service.clone(),
+              "target": {
+                "entity_id": ha_id.clone()
               },
 
               "service_data": {},
