@@ -9,9 +9,8 @@ use embedded_svc::{
     wifi::{ClientConfiguration, Configuration},
     ws::FrameType,
 };
-use esp_idf_hal::{modem::Modem, peripheral};
+use esp_idf_hal::{modem::Modem, peripheral, io::EspIOError};
 use esp_idf_svc::{
-    errors::EspIOError,
     eventloop::{EspEventLoop, EspSystemEventLoop, System},
     sntp::{self, SyncStatus},
     wifi::{BlockingWifi, EspWifi},
@@ -56,7 +55,7 @@ pub fn handle_websocket(
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    let socket_to_me = move |info: &Result<WebSocketEvent<'_>, EspIOError>| {
+    let socket_to_me = move |info: & Result<WebSocketEvent<'_>, EspIOError>| {
         let auth_okay = js("auth_ok");
 
         match info {
@@ -114,7 +113,7 @@ pub fn handle_websocket(
                 let mut config = EspWebSocketClientConfig::default();
                 config.buffer_size = 2048;
                 let tmp_socket_client = EspWebSocketClient::new(
-                    format!("ws://{}/api/websocket", ha_url),
+                    &format!("ws://{}/api/websocket", ha_url),
                     &config,
                     Duration::from_secs(35),
                     socket_to_me.clone(),

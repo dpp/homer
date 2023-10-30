@@ -3,7 +3,7 @@ use std::time::Duration;
 use anyhow::Result;
 use crossbeam::channel::Sender;
 use esp_idf_hal::{
-    adc::{self, config::Config, AdcChannelDriver, AdcDriver, ADC1},
+    adc::{attenuation, config::Config, AdcChannelDriver, AdcDriver, ADC1},
     gpio::Gpio1,
 };
 
@@ -21,7 +21,7 @@ fn reading_to_button(reading: u16) -> Option<u8> {
 
 pub fn button_loop(button_tx: Sender<usize>, gpio1: Gpio1, adc1: ADC1) -> Result<()> {
     let mut adc = AdcDriver::new(adc1, &Config::new().calibration(true))?;
-    let mut adc_pin = AdcChannelDriver::<_, adc::Atten11dB<adc::ADC1>>::new(gpio1)?;
+    let mut adc_pin = AdcChannelDriver::<{ attenuation::DB_11 }, Gpio1>::new(gpio1)?;
 
     // 700-900 button 3
     // 1900-2200 button 2
